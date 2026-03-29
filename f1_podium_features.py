@@ -22,6 +22,8 @@ import time
 import warnings
 warnings.filterwarnings("ignore")
 
+import os
+os.makedirs("f1_cache", exist_ok=True)
 fastf1.Cache.enable_cache("f1_cache")
 
 JOLPICA_BASE = "https://api.jolpi.ca/ergast/f1"
@@ -70,10 +72,10 @@ def get_race_results(season: int) -> pd.DataFrame:
                 "driver_code": res["Driver"].get("code", "UNK"),
                 "constructor": res["Constructor"]["constructorId"],
                 "grid":        int(res.get("grid", 0)),
-                "position":    int(res["position"]) if res.get("position","\\R").isdigit() else 99,
+                "position":    int(res["position"]) if res.get("position", "\\R").isdigit() else 99,
                 "points":      float(res.get("points", 0)),
                 "status":      res.get("status", "Unknown"),
-                "on_podium":   int(res["position"]) <= 3 if res.get("position","").isdigit() else 0,
+                "on_podium":   int(res["position"]) <= 3 if res.get("position", "").isdigit() else 0,
             })
     return pd.DataFrame(rows)
 
@@ -112,10 +114,10 @@ def get_constructor_standings(season: int) -> pd.DataFrame:
     for s in standings:
         for entry in s.get("ConstructorStandings", []):
             rows.append({
-                "season":       season,
-                "constructor":  entry["Constructor"]["constructorId"],
-                "car_rank":     int(entry["position"]),
-                "car_points":   float(entry.get("points", 0)),
+                "season":      season,
+                "constructor": entry["Constructor"]["constructorId"],
+                "car_rank":    int(entry["position"]),
+                "car_points":  float(entry.get("points", 0)),
             })
     return pd.DataFrame(rows)
 
@@ -142,6 +144,7 @@ def add_rolling_form(results: pd.DataFrame) -> pd.DataFrame:
         return grp[col].shift(1).rolling(n, min_periods=1).agg(func)
 
     g = results.groupby("driver_id")
+
     results["rolling_podium_rate"] = g.apply(
         lambda x: rolling_stat(x, "on_podium", "mean")
     ).reset_index(level=0, drop=True)
@@ -154,10 +157,16 @@ def add_rolling_form(results: pd.DataFrame) -> pd.DataFrame:
         lambda x: rolling_stat(x, "points", "mean")
     ).reset_index(level=0, drop=True)
 
+    # ── FIX: convert status string to numeric 0/1 flag before rolling ──
+    results["is_dnf"] = results["status"].str.contains(
+        "Retired|Accident|Engine|Gearbox|Collision|Mechanical|Hydraulics|Suspension",
+        na=False
+    ).astype(float)
+
     results["rolling_dnf_rate"] = g.apply(
-        lambda x: rolling_stat(x, "status",
-                               lambda s: s.str.contains("Retired|Accident|Engine", na=False).mean())
+        lambda x: rolling_stat(x, "is_dnf", "mean")
     ).reset_index(level=0, drop=True)
+    # ───────────────────────────────────────────────────────────────────
 
     results["rolling_grid_avg"] = g.apply(
         lambda x: rolling_stat(x, "grid", "mean")
@@ -174,15 +183,8 @@ def extract_driving_style(season: int, round_num: int) -> pd.DataFrame:
 
     Driving style features:
       tyre_deg_slope   — how fast lap times increase per lap of tyre age
-                         (high = aggressive on tyres, low = gentle/conservative)
-      brake_consistency — std dev of braking points across laps
-                         (low = consistent/precise, high = erratic)
       avg_throttle_pct — mean throttle application across the race
-                         (proxy for aggressive vs conservative driving style)
       overtake_count   — positions gained from grid to finish
-                         (proxy for racecraft and aggression)
-
-    Note: telemetry loading is slow (~30s per session). We cache aggressively.
     """
     try:
         session = fastf1.get_session(season, round_num, "R")
@@ -196,14 +198,14 @@ def extract_driving_style(season: int, round_num: int) -> pd.DataFrame:
             drv_laps["lap_sec"] = drv_laps["LapTime"].dt.total_seconds()
             drv_laps = drv_laps[drv_laps["lap_sec"] > 60]
 
-            # Tyre degradation slope: fit a line to lap_time vs tyre_age
+            # Tyre degradation slope
             deg_slope = 0.0
             if len(drv_laps) > 5 and "TyreLife" in drv_laps.columns:
                 valid = drv_laps[["TyreLife", "lap_sec"]].dropna()
                 if len(valid) > 3:
                     deg_slope = float(np.polyfit(valid["TyreLife"], valid["lap_sec"], 1)[0])
 
-            # Throttle percentage from telemetry (sample first 10 laps for speed)
+            # Throttle percentage from telemetry
             avg_throttle = 0.0
             try:
                 sample_laps = drv_laps.head(10)
@@ -217,11 +219,11 @@ def extract_driving_style(season: int, round_num: int) -> pd.DataFrame:
             except Exception:
                 pass
 
-            # Positions gained = grid position minus finishing position
+            # Positions gained
             info = session.get_driver(driver)
-            grid_pos    = drv_laps.iloc[0].get("GridPosition", 10) if len(drv_laps) > 0 else 10
-            finish_pos  = drv_laps.iloc[-1].get("Position", grid_pos) if len(drv_laps) > 0 else grid_pos
-            overtakes   = max(0, int(grid_pos) - int(finish_pos)) if grid_pos and finish_pos else 0
+            grid_pos   = drv_laps.iloc[0].get("GridPosition", 10) if len(drv_laps) > 0 else 10
+            finish_pos = drv_laps.iloc[-1].get("Position", grid_pos) if len(drv_laps) > 0 else grid_pos
+            overtakes  = max(0, int(grid_pos) - int(finish_pos)) if grid_pos and finish_pos else 0
 
             rows.append({
                 "driver_number":    driver,
@@ -243,11 +245,7 @@ def extract_driving_style(season: int, round_num: int) -> pd.DataFrame:
 def add_quali_gap(df: pd.DataFrame, quali: pd.DataFrame) -> pd.DataFrame:
     """
     Compute each driver's qualifying gap to pole position in seconds.
-    Gap to pole is the single strongest pre-race predictor of podium
-    likelihood — it captures both car pace and driver one-lap pace.
-
-    Drivers who failed to set a Q3 time (knocked out in Q1/Q2) get
-    a large penalty gap to reflect their poor relative pace.
+    Drivers who failed to set a Q3 time get a penalty gap of 3.0s.
     """
     def parse_time(t):
         if pd.isna(t) or not isinstance(t, str):
@@ -270,7 +268,7 @@ def add_quali_gap(df: pd.DataFrame, quali: pd.DataFrame) -> pd.DataFrame:
     )
     quali = quali.join(pole_times, on=["season", "round"])
     quali["quali_gap"] = quali["q_sec"] - quali["pole_time"]
-    quali["quali_gap"] = quali["quali_gap"].fillna(3.0)   # penalty for no Q3 time
+    quali["quali_gap"] = quali["quali_gap"].fillna(3.0)
 
     return df.merge(
         quali[["season", "round", "driver_id", "quali_pos", "quali_gap"]],
@@ -285,14 +283,6 @@ def build_feature_dataset(seasons=SEASONS, use_telemetry=True) -> pd.DataFrame:
     """
     Orchestrate the full feature build across all seasons.
     Returns a DataFrame ready for model training.
-
-    Steps:
-      1. Fetch race results + qualifying from Jolpica
-      2. Add rolling form features (last N races)
-      3. Merge constructor standings as car quality proxy
-      4. Optionally merge FastF1 driving style features
-      5. Add qualifying gap to pole
-      6. Final cleanup and type casting
     """
     all_results = []
     all_quali   = []
@@ -304,7 +294,7 @@ def build_feature_dataset(seasons=SEASONS, use_telemetry=True) -> pd.DataFrame:
         all_results.append(get_race_results(season))
         all_quali.append(get_qualifying_results(season))
         all_constr.append(get_constructor_standings(season))
-        time.sleep(0.3)   # rate limit
+        time.sleep(0.3)
 
     results = pd.concat(all_results, ignore_index=True)
     quali   = pd.concat(all_quali,   ignore_index=True)
@@ -326,9 +316,9 @@ def build_feature_dataset(seasons=SEASONS, use_telemetry=True) -> pd.DataFrame:
     if use_telemetry:
         print("Extracting FastF1 driving style (slow — disable with use_telemetry=False)...")
         style_frames = []
-        for season in seasons[-2:]:   # only last 2 seasons for speed
+        for season in seasons[-2:]:
             races = results[results["season"] == season]["round"].unique()
-            for round_num in races[:5]:   # first 5 races per season
+            for round_num in races[:5]:
                 print(f"  FastF1 {season} R{round_num}...")
                 style = extract_driving_style(season, int(round_num))
                 if not style.empty:
@@ -340,22 +330,23 @@ def build_feature_dataset(seasons=SEASONS, use_telemetry=True) -> pd.DataFrame:
         if style_frames:
             style_df = pd.concat(style_frames, ignore_index=True)
             results = results.merge(
-                style_df[["season","round","driver_id","tyre_deg_slope","avg_throttle_pct","overtake_count"]],
-                on=["season","round","driver_id"],
+                style_df[["season", "round", "driver_id", "tyre_deg_slope",
+                           "avg_throttle_pct", "overtake_count"]],
+                on=["season", "round", "driver_id"],
                 how="left"
             )
 
     # Fill missing style features with neutral defaults
-    for col in ["tyre_deg_slope","avg_throttle_pct","overtake_count"]:
+    for col in ["tyre_deg_slope", "avg_throttle_pct", "overtake_count"]:
         if col not in results.columns:
             results[col] = 0.0
         results[col] = results[col].fillna(0.0)
 
     # Fill other missing values
-    results["quali_gap"]   = results["quali_gap"].fillna(3.0)
-    results["quali_pos"]   = results["quali_pos"].fillna(10.0)
-    results["car_rank"]    = results["car_rank"].fillna(5.0)
-    results["car_points"]  = results["car_points"].fillna(100.0)
+    results["quali_gap"]  = results["quali_gap"].fillna(3.0)
+    results["quali_pos"]  = results["quali_pos"].fillna(10.0)
+    results["car_rank"]   = results["car_rank"].fillna(5.0)
+    results["car_points"] = results["car_points"].fillna(100.0)
 
     print(f"\nDone. Dataset shape: {results.shape}")
     print(f"Podium rate in dataset: {results['on_podium'].mean()*100:.1f}%")
